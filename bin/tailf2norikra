@@ -1,0 +1,321 @@
+#!/usr/bin/env ruby
+
+require 'norikra-client'
+require 'json'
+require 'yaml'
+require 'hash_symbolizer'
+require 'schash'
+require 'rb-inotify'
+require 'timers'
+require 'socket'
+require 'fileutils'
+require 'logger'
+require 'mixlib/shellout'
+require 'optparse'
+
+$stdout.sync = true
+
+Thread.abort_on_exception = true
+
+@config = nil
+
+loglevels = {
+  :debug => Logger::DEBUG,
+  :info => Logger::INFO,
+  :warn => Logger::WARN,
+  :error => Logger::Error,
+  :fatal => Logger::FATAL,
+  :unknown => Logger::UNKNOWN
+}
+
+@loglevel = Logger::INFO
+
+opts = OptionParser.new
+opts.banner = "Usage: #{$0} [options]"
+opts.on( '--config PATH', String, 'Path to settings config' ) { |c| @config = c }
+opts.on( '--log-level [LEVEL]', [:debug, :info, :warn, :error, :fatal, :unknown] ) { |l| @loglevel = loglevels[l] }
+opts.on( '-h', '--help', 'Display this screen' ) { puts opts; exit 0 }
+opts.parse!
+
+unless @config
+  puts opts
+  exit 1
+end
+
+@logger = Logger.new(STDOUT)
+
+@settings = YAML.load_file(@config).symbolize_keys(true)
+
+validator = Schash::Validator.new do
+  {
+    tailf: {
+      files: array_of({
+        target: string,
+        prefix: string,
+        suffix: optional(string),
+        time_pattern: string,
+        timestamp_field: optional(string),
+        prune_events_older_than: optional(integer),
+        max_batch_lines: optional(integer)
+      }),
+      position_file: string,
+      flush_interval: integer,
+      max_batch_lines: optional(integer),
+      from_begining: boolean,
+      delete_old_tailed_files: optional(boolean),
+      post_delete_command: optional(string),
+    },
+    norikra: {
+      host: string,
+      port: integer
+    }
+  }
+end
+
+unless validator.validate(@settings).empty?
+  @logger.error("ERROR: bad settings")
+  @logger.error(validator.validate(@settings))
+  exit 1
+end
+
+@settings[:tailf][:files] = @settings[:tailf][:files].map{|h| h.symbolize_keys(true)}
+
+@mutex = Mutex.new
+
+@create_notifier = INotify::Notifier.new
+@delete_notifier = INotify::Notifier.new
+@tailf_notifier = INotify::Notifier.new
+
+@dirs = {}
+@files = {}
+@threads = {}
+@position_file = @settings[:tailf][:position_file]
+@flush_interval = @settings[:tailf][:flush_interval]
+@max_batch_lines = @settings[:tailf].has_key?(:max_batch_lines) ? @settings[:tailf][:max_batch_lines] : 1024
+@from_begining = @settings[:tailf][:from_begining]
+@delete_old_tailed_files = @settings[:tailf].has_key?(:delete_old_tailed_files) ?  @settings[:tailf][:delete_old_tailed_files] : false
+@norikra_host = @settings[:norikra][:host]
+@norikra_port = @settings[:norikra][:port]
+@send = @settings[:norikra].has_key?(:send) ? @settings[:norikra][:send] : true
+
+def write_position_file
+  @mutex.synchronize do
+    File.open(@position_file, 'w') do |file|
+      @files.each do |path, attrs|
+        file.puts "#{path} #{attrs[:pattern]} #{attrs[:target]} #{attrs[:inode]} #{attrs[:offset]}"
+      end
+    end
+  end
+end
+
+def load_position_file
+  if File.exist?(@position_file)
+    IO.readlines(@position_file).each do |line|
+      path, pattern, target, inode, offset = line.split(' ')
+      #Load state only for that exist with same inode and were not truncated/rewinded.
+      if File.exists?(path) and File.stat(path).ino == inode.to_i and File.stat(path).size >= offset.to_i
+        @files[path] = { :pattern => pattern, :target => target, :inode => inode.to_i, :offset => offset.to_i }
+      end
+    end
+  end
+  write_position_file
+end
+
+load_position_file
+
+@norikra = Norikra::Client.new(@norikra_host, @norikra_port)
+
+@events_queue = SizedQueue.new(10)
+
+@sender_thread = Thread.new do
+  loop do
+    batch = @events_queue.pop
+    begin
+      @norikra.send(batch[:target], batch[:events]) if @send
+    rescue Errno::ECONNREFUSED
+      @logger.warn("Connection refused to norikra server, retrying in 1 second ...")
+      sleep 1
+      retry
+    rescue Norikra::RPC::ServiceUnavailableError
+      @logger.warn("Got Norikra::RPC::ServiceUnavailableError while trying to senv events to norikra, retrying in 1 second ...")
+      sleep 1
+      retry
+    end
+    @files[batch[:path]][:offset] = batch[:offset]
+  end
+end
+
+def norikra_send(path, buffer, offset)
+  prune_old_events = @files[path].has_key?(:timestamp_field) and @files[path].has_key?(:prune_events_older_than)
+  events = []
+  while event = buffer.shift
+    begin
+      event = JSON.parse(event)
+      if prune_old_events
+        unless event.has_key?(@files[path][:timestamp_field]) 
+          @logger.warn("Ignoring event without timestamp field #{@files[path][:timestamp_field]} #{event}")
+        else
+          if Time.now.to_i - event[@files[path][:timestamp_field]] > @files[path][:prune_events_older_than]
+            @logger.debug("Ignoring old event #{event}")
+          else
+            events << event
+          end
+        end
+      end
+    rescue => e
+      @logger.warn("Warning: Got bad json event #{event} #{e.message}")
+    end
+  end
+  @events_queue.push({ :path => path, :target => @files[path][:target], :events => events, :offset => offset})
+end
+
+def tailf(path)
+  file = File.open(path, 'r')
+  @files[path][:fd] = file
+  file.seek(@files[path][:offset], IO::SEEK_SET)
+
+  loop do #Fast read file in batches until we reach EOF upon which we start the tailf modify watcher
+    batch = file.each_line.take(@files[path][:max_batch_lines])
+    break if batch.empty?
+    norikra_send(path, batch, file.pos)
+  end
+
+  mutex = Mutex.new
+  @tailf_notifier.watch(path, :modify) do |event|
+    mutex.synchronize do
+      unless file.closed?
+        loop do
+          batch = file.each_line.take(@files[path][:max_batch_lines])
+          break if batch.empty?
+          norikra_send(path, batch, file.pos)
+        end
+      else
+        @logger.warn("watcher got modify event on closed file #{event.name}")
+      end
+    end
+  end
+end
+
+@time_regexp_hash = {
+  'Y' => '[0-9]{4}',
+  'm' => '[0-9]{2}',
+  'd' => '[0-9]{2}',
+  'H' => '[0-9]{2}',
+  'M' => '[0-9]{2}'
+}
+
+def time_pattern_to_regexp(pattern)
+  pattern.gsub(/%([^%])/) do
+    match = $1
+    @time_regexp_hash.has_key?(match) ? @time_regexp_hash[match] : match
+  end
+end
+
+#Scan existing files that match watched prefixes and start failing them
+@settings[:tailf][:files].each do |tailf_file|
+  tailf_file[:prefix] = File.expand_path(tailf_file[:prefix])
+  dir = File.dirname(tailf_file[:prefix])
+  if File.exists?(dir) and File.directory?(dir)
+    dir_pattern_config = { :prefix => File.basename(tailf_file[:prefix]), :pattern => tailf_file[:time_pattern], :suffix => "#{tailf_file[:suffix]}", :targer => tailf_file[:target] }
+    dir_pattern_config[:timestamp_field] = tailf_file[:timestamp_field] if tailf_file.has_key?(:timestamp_field)
+    dir_pattern_config[:prune_events_older_than] = tailf_file[:prune_events_older_than] if tailf_file.has_key?(:prune_events_older_than)
+    dir_pattern_config[:max_batch_lines] = tailf_file.has_key?(:max_batch_lines) ? tailf_file[:max_batch_lines] : @max_batch_lines
+    @dirs[dir] ||= []
+    @dirs[dir] << dir_pattern_config
+    Dir.glob("#{tailf_file[:prefix]}*#{tailf_file[:suffix]}").each do |path|
+      if path.match(Regexp.new(time_pattern_to_regexp(tailf_file[:time_pattern])))
+        unless File.directory?(path)
+          #Populate state only if it was not loaded from position file
+          unless @files.has_key?(path)
+            @files[path] = { :pattern => tailf_file[:time_pattern], :target => tailf_file[:target], :inode => File.stat(path).ino, :offset => 0 }
+            @files[path][:offset] = File.stat(path).size unless @from_begining
+          end
+          @files[path][:max_batch_lines] = dir_pattern_config[:max_batch_lines]
+          if tailf_file.has_key?(:timestamp_field) and tailf_file.has_key?(:prune_events_older_than)
+            @files[path][:timestamp_field] = tailf_file[:timestamp_field]
+            @files[path][:prune_events_older_than] = tailf_file[:prune_events_older_than]
+          end
+          @threads[path] = Thread.new { tailf(path) } unless @threads.has_key?(path)
+        end
+      end
+    end
+  end
+end
+
+def delete_old_tailed_files
+  @mutex.synchronize do
+    @files.each_key do |path|
+      unless path.match(Regexp.new(Time.now.strftime(@files[path][:pattern])))
+        if File.exists?(path) and File.stat(path).ino == @files[path][:inode] and File.stat(path).size == @files[path][:offset] and (Time.now - File.stat(path).mtime) > 30
+          @logger.info("Deleteing old time pattern fully kafka produced file #{path}")
+          FileUtils.rm_r(path)
+          if @settings[:tailf].has_key?(:post_delete_command)
+            @logger.info("Running post delete command => #{@settings[:tailf][:post_delete_command]}")
+            command = Mixlib::ShellOut.new(@settings[:tailf][:post_delete_command])
+            begin
+              command.run_command
+              if command.error?
+                @logger.error("Failed post delete command => #{@settings[:tailf][:post_delete_command]}")
+                @logger.info("STDOUT: #{command.stdout}")
+                @logger.info("STDERR: #{command.stderr}")
+              end
+            rescue => e
+              @logger.error("Failed post delete command => #{@settings[:tailf][:post_delete_command]}")
+              @logger.info(e.message)
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+@timers = Timers::Group.new
+@uploads_timer = @timers.every(@flush_interval) { write_position_file }
+@delete_old_tailed_files_timer = @timers.every(60) { delete_old_tailed_files } if @delete_old_tailed_files
+Thread.new { loop { @timers.wait } }
+
+@dirs.each_key do |dir|
+
+  @create_notifier.watch(dir, :create, :moved_to) do |event|
+    @mutex.synchronize do
+      path = "#{dir}/#{event.name}"
+      match = @dirs[dir].detect{|h| event.name.match(Regexp.new(h[:prefix] + time_pattern_to_regexp(h[:pattern]) + h[:suffix]))}
+      if match
+        unless File.directory?(path)
+          unless @threads.has_key?(path)
+            @logger.info("File #{event.name} was created in / moved into watched dir #{dir}")
+            @files[path] = { :pattern => match[:pattern], :target => match[:target], :inode => File.stat(path).ino, :offset => 0, :max_batch_lines => match[:max_batch_lines] }
+            if match.has_key?(:timestamp_field) and match.has_key?(:prune_events_older_than)
+              @files[path][:timestamp_field] = match[:timestamp_field]
+              @files[path][:prune_events_older_than] = match[:prune_events_older_than]
+            end
+            @threads[path] = Thread.new { tailf(path) }
+          end
+        end
+      end
+    end
+  end
+
+  @delete_notifier.watch(dir, :delete, :moved_from) do |event|
+    @mutex.synchronize do
+      path = "#{dir}/#{event.name}"
+      if @threads.has_key?(path)
+        @logger.info("File #{event.name} was deleted / moved from watched dir #{dir}")
+        if @threads[path].alive?
+          @threads[path].terminate
+          @threads[path].join
+        end
+        @threads.delete(path)
+        @files[path][:fd].close unless @files[path][:fd].closed?
+        @files.delete(path)
+      end
+    end
+  end
+
+end
+
+Thread.new { @create_notifier.run }
+Thread.new { @delete_notifier.run }
+
+@tailf_notifier.run
