@@ -1,3 +1,3 @@
 module Tailf2Norikra
-  VERSION ||= '0.1.7'
+  VERSION ||= '0.0.1'
 end
